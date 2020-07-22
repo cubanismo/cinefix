@@ -86,37 +86,55 @@ def processChunk(f, readSamples=False):
 		return ChunkRec(sHdr)
 
 class VidState:
-	def __init__(self, sampleRate, vidTime=0, aNextTime=float32(0), firstSample=True):
+	def __init__(self, sampleRate, vidTime=0, aNextTime=float32(0), firstAudioSample=True):
 		self.sampleRate = float32(sampleRate)
 		self.vidTime = vidTime
 		self.aNextTime = aNextTime
-		self.firstSample = firstSample
+		self.firstAudioSample = firstAudioSample
 
-def checkChunk(cRec, vs):
-	for sampleRec in cRec.sampleHeader.sampleRecords:
-		if vs.aNextTime < float32(vs.vidTime + 1):
+	def setNextAudioSampleTime(self, curSample, timescale):
+		# XXX assumes 8-bit audio
+		sampleDuration = (float32(curSample.size) / self.sampleRate) * float32(timescale)
+		print("Audio sample duration: " + str(sampleDuration))
+		if self.firstAudioSample:
+			self.aNextTime += float32(sampleDuration) / float32(2.0)
+			self.firstAudioSample = False
+		else:
+			self.aNextTime = float32(sampleDuration) + self.aNextTime
+
+		print("New tNext: " + str(self.aNextTime) + " current vidTime: " + str(self.vidTime))
+
+	def getNextSampleType(self):
+		if self.aNextTime < float32(self.vidTime + 1):
+			return 'Audio'
+		else:
+			return 'Video'
+
+	def processSample(self, curSample, timescale):
+		if curSample.type == 'Audio':
+			self.setNextAudioSampleTime(curSample, timescale)
+		else:
+			self.vidTime += curSample.duration
+
+	def checkSample(self, sampleRec, timescale):
+		nextSampleType = self.getNextSampleType()
+
+		if nextSampleType == 'Audio':
 			if sampleRec.type != 'Audio':
 				print("Audio sample not found at expected time!")
-				print("  Vid time: " + str(vs.vidTime) + " aNextTime: " + str(vs.aNextTime))
+				print("  Vid time: " + str(self.vidTime) + " aNextTime: " + str(self.aNextTime))
 				sys.exit(1)
-			else:
-				# XXX assumes 8-bit audio
-				sampleDuration = (float32(sampleRec.size) / vs.sampleRate) * float32(cRec.sampleHeader.timescale)
-				print("Audio sample duration: " + str(sampleDuration))
-				if vs.firstSample:
-					vs.aNextTime = (float32(sampleDuration) / float32(2.0)) + vs.aNextTime
-					vs.firstSample = False
-				else:
-					vs.aNextTime = float32(sampleDuration) + vs.aNextTime
 
-				print("New tNext: " + str(vs.aNextTime) + " current vidTime: " + str(vs.vidTime))
 		else:
 			if sampleRec.type != 'Video':
 				print("Audio sample found before expected time!")
-				print("  Calculated time units remaining: " + str(vs.aNextTime - float32(vs.vidTime)))
+				print("  Calculated time units remaining: " + str(self.aNextTime - float32(self.vidTime)))
 				sys.exit(1)
-			else:
-				vs.vidTime += sampleRec.duration
+
+	def checkChunk(self, cRec):
+		for sampleRec in cRec.sampleHeader.sampleRecords:
+			self.checkSample(sampleRec, cRec.sampleHeader.timescale)
+			self.processSample(sampleRec, cRec.sampleHeader.timescale)
 
 with open("ct-1.crg", "rb") as cpkIn:
 	# Read Frame/Film header atom
@@ -252,7 +270,7 @@ with open("ct-1.crg", "rb") as cpkIn:
 			cRec = processChunk(cpkIn)
 
 			print("At chunk start, Vid time: " + str(vs.vidTime) + " next audio sample time: " + str(vs.aNextTime))
-			checkChunk(cRec, vs)
+			vs.checkChunk(cRec)
 			firstChunk = False
 	else:
 		print("No sample or chunk table found!")
