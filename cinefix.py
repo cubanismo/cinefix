@@ -8,86 +8,135 @@ def getInt(f):
 	return(int.from_bytes(f.read(4), byteorder='big'))
 
 class SampleRec:
+	def commonInit(self):
+		if self.time == 0x7FFFFFFF:
+			self.type = 'Audio'
+		else:
+			self.type = 'Video'
+		
 	def __init__(self, start, size, time, duration):
 		self.start = start
 		self.size = size
 		self.time = time
 		self.duration = duration
+		self.commonInit()
 
+	def __init__(self, f):
+		self.start = getInt(f)
+		self.size = getInt(f)
+		self.time = getInt(f) & 0x7FFFFFFF
+		self.duration = getInt(f)
+		self.commonInit()
+
+	def isAudio(self):
 		if self.time == 0x7FFFFFFF:
-			self.type = 'Audio'
+			return True
 		else:
-			self.type = 'Video'
+			return False
 
-class SampleHdr:
+class SampleTable:
+	def commonInit(self):
+		self.timeUnit = 1.0 / float(self.timescale)
+		
 	def __init__(self, timescale, sampleRecords):
 		self.timescale = timescale
-		self.timeUnit = 1.0 / float(timescale)
 		self.sampleRecords = sampleRecords
+		self.commonInit()
+
+	def __init__(self, f):
+		hdr = f.read(4)
+
+		if b'STAB' != hdr:
+			print("Sample table header not found")
+			sys.exit(1)
+
+		hdrSize = getInt(f)
+
+		self.timescale = getInt(f)
+
+		self.commonInit()
+
+		count = getInt(f)
+
+		self.sampleRecords = []
+
+		if hdrSize != 16 + (16 * count):
+			print("WARNING: Invalid sample header size detected!")
+	
+		for sNum in range(count):
+			sRec = SampleRec(f)
+			self.sampleRecords.append(sRec)
 
 class ChunkRec:
-	def __init__(self, sampleHeader, samples=[]):
-		self.sampleHeader = sampleHeader
+	def __init__(self, start, size, time, syncPattern):
+		self.start = start
+		self.size = size
+		self.time = time
+		self.syncPattern = syncPattern
+
+	def __init__(self, f):
+		self.start = getInt(f)
+		self.size = getInt(f)
+		self.time = getInt(f)
+		self.syncPattern = getInt(f)
+
+class ChunkTable:
+	def __init__(self, timescale, chunkRecords):
+		self.timescale = timescale
+		self.chunkRecords = chunkRecords
+
+	def __init__(self, f):
+		# XXX temp
+		hdr = f.read(4)
+
+		if b'CTAB' != hdr:
+			print("Chunk table header not found")
+			sys.exit(1)
+
+		size = getInt(f)
+
+		self.timescale = getInt(f)
+
+		print("Timescale: " + str(self.timescale))
+
+		count = getInt(f)
+
+		print("Number of chunks: " + str(count))
+
+		self.chunkRecords = []
+
+		for cNum in range(count):
+			cRec = ChunkRec(f)
+			self.chunkRecords.append(cRec)
+
+class Chunk:
+	def __init__(self, syncPattern, sampleTable, samples=[]):
+		self.syncPattern = syncPattern
+		self.sampleTable = sampleTable
 		self.samples = samples
 
-def processSampleHdr(f):
-	sHdr = f.read(4)
+	def __init__(self, f, syncPattern, readSamples=False):
+		for i in range(16):
+			syncData = getInt(f)
+			if syncData != syncPattern:
+				print("WARNING: Invalid sync data in chunk!")
 
-	if b'STAB' != sHdr:
-		print("Sample table header not found")
-		sys.exit(1)
+		self.sampleTable = SampleTable(f)
 
-	sHdrSize = getInt(f)
-
-	sTimescale = getInt(f)
-
-	print("Sample timescale: " + str(sTimescale))
-
-	sTimeUnit = 1.0 / float(sTimescale)
-
-	sCount = getInt(f)
-
-	sRecs = []
-
-	for sNum in range(sCount):
-		sStart = getInt(f)
-		sSize = getInt(f)
-		sTime = getInt(f) & 0x7FFFFFFF
-		sDuration = getInt(f)
-
-		sRecs.append(SampleRec(sStart, sSize, sTime, sDuration))
-
-		if sTime == 0x7FFFFFFF:
-			print("Processed Audio sample record")
+		self.samples = []
+		if readSamples:
+			for s in self.sampleTable.sampleRecords:
+				sampleData = f.read(s.size)
+				self.samples.append(sampleData)
 		else:
-			print("Processed Video sample record at " + "{:.5f}".format(sTime * sTimeUnit) + "-" + "{:.5f}".format((sTime + sDuration) * sTimeUnit))
-
-	return SampleHdr(sTimescale, sRecs)
-
-def processChunk(f, readSamples=False):
-	# Skip chunk sync marker for now
-	f.seek(64, 1) # Seek 64 bytes from SEEK_CUR
-
-	sHdr = processSampleHdr(f)
-
-	if readSamples:
-		samples = []
-
-		for s in sHdr.sampleRecords:
-			sampleData = f.read(s.size)
-			samples.append(sampleData)
-
-		return ChunkRec(sHdr, samples)
-	else:
-		# Just skip past the sample data.
-		# Seek to offset of end of last sample from current position
-		f.seek(sHdr.sampleRecords[-1].start + sHdr.sampleRecords[-1].size, 1)
-
-		return ChunkRec(sHdr)
+			# Just skip past the sample data.
+			# Seek to offset of end of last sample from current position
+			f.seek(self.sampleTable.sampleRecords[-1].start + self.sampleTable.sampleRecords[-1].size, 1)
 
 class VidState:
-	def __init__(self, sampleRate, vidTime=0, aNextTime=float32(0), firstAudioSample=True):
+	def __init__(self, sampleRate, chunkNumber=0, vidTime=0, aNextTime=float32(0), firstAudioSample=True):
 		self.sampleRate = float32(sampleRate)
+		self.chunkNumber = chunkNumber
 		self.vidTime = vidTime
 		self.aNextTime = aNextTime
 		self.firstAudioSample = firstAudioSample
@@ -102,7 +151,7 @@ class VidState:
 		else:
 			self.aNextTime = float32(sampleDuration) + self.aNextTime
 
-		print("New tNext: " + str(self.aNextTime) + " current vidTime: " + str(self.vidTime))
+		print("Next audio sample at: " + str(self.aNextTime) + " current vidTime: " + str(self.vidTime))
 
 	def getNextSampleType(self):
 		if self.aNextTime < float32(self.vidTime + 1):
@@ -132,145 +181,192 @@ class VidState:
 				sys.exit(1)
 
 	def checkChunk(self, cRec):
-		for sampleRec in cRec.sampleHeader.sampleRecords:
-			self.checkSample(sampleRec, cRec.sampleHeader.timescale)
-			self.processSample(sampleRec, cRec.sampleHeader.timescale)
+		for sampleRec in cRec.sampleTable.sampleRecords:
+			self.checkSample(sampleRec, cRec.sampleTable.timescale)
+			self.processSample(sampleRec, cRec.sampleTable.timescale)
+		self.chunkNumber += 1
 
-with open("ct-1.crg", "rb") as cpkIn:
-	# Read Frame/Film header atom
-	hdr = cpkIn.read(4)
+class FrameDescription:
+	def __init__(self, compressionType, width, height):
+		self.compressionType = compressionType
+		self.width = width
+		self.height = height
 
-	if b'FILM' != hdr:
-		print("Film header not found")
-		sys.exit(1)
+	def __init__(self, f):
+		hdr = f.read(4)
 
-	hdrSize = getInt(cpkIn)
-	# Skip over version and reserved fields
-	cpkIn.seek(8, 1) # 8 bytes from SEEK_CUR
-
-	# Read Frame Description atom
-	hdr = cpkIn.read(4)
-
-	if b'FDSC' != hdr:
-		print("Frame description not found")
-		sys.exit(1)
-
-	fdscSize = getInt(cpkIn)
-	
-	if fdscSize != 20:
-		print("Invalid frame description size")
-		sys.exit(1)
-
-	cType = cpkIn.read(4)
-
-	if cType == b'cvid':
-		print("Processing Cinepak compressed-RGB movie")
-	elif cType == b'$CRY':
-		print("Processing Cinepak expanded-CRY movie")
-	elif cType == b'$RGB':
-		print("Processing Cinepak expanded-RGB movie")
-	else:
-		print("Unknown Cinepak compression type!")
-		sys.exit(1)
-
-	height = getInt(cpkIn)
-	width = getInt(cpkIn)
-
-	print("Resolution: " + str(width) + "x" + str(height))
-
-	# Is there an Audio Description Atom?
-	hdr = cpkIn.read(4)
-
-	if b'ADSC' == hdr:
-		adscSize = getInt(cpkIn)
-
-		if adscSize != 20:
-			print("Invalid audio description size")
+		if b'FDSC' != hdr:
+			print("Frame description header not found")
 			sys.exit(1)
 
-		audioData = getInt(cpkIn)
+		size = getInt(f)
+	
+		if size != 20:
+			print("Invalid frame description size: " + str(size))
+			sys.exit(1)
 
-		if audioData & 0x1:
-			channels = "Stereo"
-		else:
-			channels = "Mono"
+		self.compressionType = f.read(4)
+		self.height = getInt(f)
+		self.width = getInt(f)
 
-		if audioData & 0x2:
-			bits = "16-bit"
-		else:
-			bits = "8-bit"
-
-		audioCmpr = (audioData >> 2) & 0x3f
-		
-		if audioCmpr == 0x0:
-			compression = "uncompressed"
-		elif audioCmpr == 0x1:
-			compression = "n^2 compression"
-		else:
-			compression = "unknown compression"
-
-		if audioCmpr & 0x80000000:
-			signed = "signed"
-		else:
-			signed = "unsigned"
-
-		print(bits + " " + signed + " " + channels + " (" + compression + ") Audio")
-
-		sclk = getInt(cpkIn)
-
-		print("Audio SCLK: " + str(sclk))
-
-		driftRate = getInt(cpkIn)
-
-		print("Audio drift rate: " + str(driftRate))
-
+class AudioDescription:
+	def commonInit(self):
 		# This is the NTSC video clock, in Hz.  The PAL one is 26593900.
 		# Which is correct when value is baked into a region-agnostic file???
 		jagVidClock = 26590906
 
 		# jagSampleRate = (jagVidClock / (2 * (sclk + 1))) / 32
-		jagSampleRate = Fraction(jagVidClock, (2 * (sclk + 1)) * 32)
+		jagSampleRate = Fraction(jagVidClock, (2 * (self.sclk + 1)) * 32)
 
 		# sampleRate = jagSampleRate + (jagSampleRate / (2^32 / driftRate))
-		sampleRate = float(jagSampleRate + Fraction(jagSampleRate, Fraction(0xFFFFFFFF, driftRate)))
+		self.sampleRate = float(jagSampleRate + Fraction(jagSampleRate, Fraction(0xFFFFFFFF, self.driftRate)))
+		
+	def __init__(self, channels=1, bits=8, compression="uncompressed", signed=0, sclk=0x18, driftRate=0x481db08):
+		self.channels = channels
+		self.bits = bits
+		self.compression = compression
+		self.signed = signed
+		self.sclk = sclk
+		self.driftRate = driftRate
 
-		print("Audio sample rate: " + str(sampleRate))
+		self.commonInit()
 
-		# Read next header (Chunk table or Sample table)
-		hdr = cpkIn.read(4)
+	def __init__(self, f):	
+		hdr = f.read(4)
+
+		if b'ADSC' != hdr:
+			print("Audio description header not found")
+			sys.exit(1)
+
+		size = getInt(f)
+
+		if size != 20:
+			print("WARNING: Invalid audio description size detected!")
+			sys.exit(1)
+
+		audioData = getInt(f)
+
+		self.channels = audioData & 0x1
+
+		if audioData & 0x2:
+			self.bits = 16
+		else:
+			self.bits = 8
+
+		audioCmpr = (audioData >> 2) & 0x3f
+		
+		if audioCmpr == 0x0:
+			self.compression = "uncompressed"
+		elif audioCmpr == 0x1:
+			self.compression = "n^2 compression"
+		else:
+			self.compression = "unknown compression"
+
+		self.signed = audioData >> 31
+
+		self.sclk = getInt(f)
+
+		self.driftRate = getInt(f)
+
+		self.commonInit()
+
+class Film:
+	def __init__(self, frameDesc, audioDesc, chunkTable, sampleTable=None):
+		self.frameDesc = frameDesc
+		self.audioDesc = audioDesc
+		self.chunkTable = chunkTable
+		self.sampleTable = sampleTable
+
+	def __init__(self, f):
+		# Read Frame/Film header atom
+		hdr = f.read(4)
+
+		if b'FILM' != hdr:
+			print("Film header not found")
+			sys.exit(1)
+
+		hdrSize = getInt(f)
+		# Skip over version and reserved fields
+		f.seek(8, 1) # 8 bytes from SEEK_CUR
+
+		self.frameDesc = FrameDescription(f)
+
+		# Peak ahead to see if there is an Audio Description Atom?
+		hdr = f.read(4)
+		f.seek(-4, 1) # Seek back 4 bytes from SEEK_CUR
+
+		if b'ADSC' == hdr:
+			self.audioDesc = AudioDescription(f)
+		else:
+			self.audioDesc = AudioDescription()
+
+		self.chunks = []
+
+		# Peak ahead to see if this is a chunky or smooth film
+		hdr = f.read(4)
+		f.seek(-4, 1) # Seek back 4 bytes from SEEK_CUR
+
+		if b'STAB' == hdr:
+			# Smooth film
+			self.sampleTable = SampleTable(f)
+			self.chunkTable = None
+		elif b'CTAB' == hdr:
+			# Chunky film
+			self.sampleTablel = None
+			self.chunkTable = ChunkTable(f)
+			# Read the chunk sample tables, but skip their samples.
+			for cRec in self.chunkTable.chunkRecords:
+				self.chunks.append(Chunk(f, cRec.syncPattern))
+		else:
+			print("Neither Sample nor Chunk table found")
+			sys.exit(1)
+
+with open("ct-1.crg", "rb") as cpkIn:
+	film = Film(cpkIn)
+
+	cType = film.frameDesc.compressionType
+
+	if cType == b'cvid':
+		print("Processed Cinepak compressed-RGB movie")
+	elif cType == b'$CRY':
+		print("Processed Cinepak expanded-CRY movie")
+	elif cType == b'$RGB':
+		print("Processed Cinepak expanded-RGB movie")
 	else:
-		print("No Audio Descriptor Atom")
-		sampleRate = 22050.0
+		print("Unknown Cinepak compression type!")
+		sys.exit(1)
 
+	print("Resolution: " + str(film.frameDesc.width) + "x" + str(film.frameDesc.height))
 
-	if b'STAB' == hdr:
+	if film.audioDesc.bits == 8:
+		bits = "8-bit"
+	else:
+		bits = "16-bit"
+
+	if film.audioDesc.signed == 1:
+		signed = "signed"
+	else:
+		signed = "unsigned"
+
+	if film.audioDesc.channels == 2:
+		channels = "stereo"
+	else:
+		channels = "mono"
+
+	print(bits + " " + signed + " " + channels + " (" + film.audioDesc.compression + ") Audio")
+	print("Audio SCLK: " + str(film.audioDesc.sclk))
+	print("Audio drift rate: " + str(film.audioDesc.driftRate))
+	print("Audio sample rate: " + str(film.audioDesc.sampleRate))
+
+	if film.chunkTable == None:
 		print("Smooth file")
-
-		processSampleHdr(cpkIn)
-	elif b'CTAB' == hdr:
+	else:
 		print("Chunky file")
 
-		ctabSize = getInt(cpkIn)
+		vs = VidState(film.audioDesc.sampleRate)
 
-		timescale = getInt(cpkIn)
-
-		print("Timescale: " + str(timescale))
-
-		chunkCount = getInt(cpkIn)
-
-		print("Number of chunks: " + str(chunkCount))
-
-		# Skip past chunk records for now
-		cpkIn.seek(chunkCount * 16, 1) # Seek chunkCount * 16 from SEEK_CUR
-
-		vs = VidState(sampleRate)
-
-		for cNum in range(chunkCount):
-			print("Processing chunk #" + str(cNum) + ":")
-			cRec = processChunk(cpkIn)
+		for cRec in film.chunkTable.chunkRecords:
+			print("Checking chunk #" + str(vs.chunkNumber) + ":")
 
 			print("At chunk start, Vid time: " + str(vs.vidTime) + " next audio sample time: " + str(vs.aNextTime))
-			vs.checkChunk(cRec)
-			firstChunk = False
-	else:
-		print("No sample or chunk table found!")
+			vs.checkChunk(film.chunks[vs.chunkNumber])
