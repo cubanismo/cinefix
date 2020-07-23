@@ -11,32 +11,39 @@ def uintBytes(i):
 	return i.to_bytes(4, byteorder='big', signed=False)
 
 class SampleRec:
-	def commonInit(self, sampleIndex):
-		self.sampleIndex = sampleIndex
+	def commonInit(self):
 		if self.time == 0x7FFFFFFF:
 			self.type = 'Audio'
 		else:
 			self.type = 'Video'
 		
-	def __init__(self, sampleIndex, start, size, time, duration):
+	def __init__(self, start, size, time, duration):
 		self.start = start
 		self.size = size
 		self.time = time
 		self.duration = duration
-		self.commonInit(sampleIndex)
+		self.commonInit()
 
-	def __init__(self, f, sampleIndex):
+	def __init__(self, f):
 		self.start = getInt(f)
 		self.size = getInt(f)
-		self.time = getInt(f) & 0x7FFFFFFF
+		time = getInt(f)
+		self.time = time & 0x7FFFFFFF
+		self.shadowSyncSample = time >> 31
 		self.duration = getInt(f)
-		self.commonInit(sampleIndex)
+		self.commonInit()
 
 	def isAudio(self):
 		if self.time == 0x7FFFFFFF:
 			return True
 		else:
 			return False
+
+	def write(self, f):
+		f.write(uintBytes(self.start))
+		f.write(uintBytes(self.size))
+		f.write(uintBytes(self.time | self.shadowSyncSample << 31))
+		f.write(uintBytes(self.duration))
 
 class SampleTable:
 	def commonInit(self):
@@ -68,14 +75,19 @@ class SampleTable:
 			print("WARNING: Invalid sample header size detected!")
 	
 		for sNum in range(count):
-			sRec = SampleRec(f, sNum)
+			sRec = SampleRec(f)
 			self.sampleRecords.append(sRec)
 
 	def getSize(self):
 		return 16 + len(self.sampleRecords) * 16
 
-	def getSampleOffset(self, sampleIndex):
-		return self.sampleRecords[sampleIndex].start
+	def write(self, f):
+		f.write(b'STAB')
+		f.write(uintBytes(self.getSize()))
+		f.write(uintBytes(self.timescale))
+		f.write(uintBytes(len(self.sampleRecords)))
+		for sRec in self.sampleRecords:
+			sRec.write(f)
 
 class Sample:
 	def __init__(self, record, data):
@@ -83,22 +95,23 @@ class Sample:
 		self.data = data
 
 class ChunkRec:
-	def commonInit(self, chunkIndex):
-		self.chunkIndex = chunkIndex
-
-	def __init__(self, chunkIndex, start, size, time, syncPattern):
+	def __init__(self, start, size, time, syncPattern):
 		self.start = start
 		self.size = size
 		self.time = time
 		self.syncPattern = syncPattern
-		self.commonInit(chunkIndex)
 
-	def __init__(self, f, chunkIndex):
+	def __init__(self, f):
 		self.start = getInt(f)
 		self.size = getInt(f)
 		self.time = getInt(f)
 		self.syncPattern = getInt(f)
-		self.commonInit(chunkIndex)
+
+	def write(self, f):
+		f.write(uintBytes(self.start))
+		f.write(uintBytes(self.size))
+		f.write(uintBytes(self.time))
+		f.write(uintBytes(self.syncPattern))
 
 class ChunkTable:
 	def __init__(self, timescale, chunkRecords):
@@ -128,11 +141,20 @@ class ChunkTable:
 		self.chunkRecords = []
 
 		for cNum in range(count):
-			cRec = ChunkRec(f, cNum)
+			cRec = ChunkRec(f)
 			self.chunkRecords.append(cRec)
 
 	def getSize(self):
 		return 16 + len(self.chunkRecords) * 16
+
+	def write(self, f):
+		f.write(b'CTAB')
+		f.write(uintBytes(self.getSize()))
+		f.write(uintBytes(self.timescale))
+		f.write(uintBytes(len(self.chunkRecords)))
+
+		for cRec in self.chunkRecords:
+			cRec.write(f)
 
 class SampleContainer:
 	def __init__(self, sampleTable=None, f=None):
@@ -179,7 +201,7 @@ class Chunk(SampleContainer):
 		f.seek(self.sampleTable.sampleRecords[-1].start + self.sampleTable.sampleRecords[-1].size, 1)
 
 	def getDataOffset(self):
-		return self.fileOffset + 64 + sampleTable.getSize()
+		return self.fileOffset + 64 + self.sampleTable.getSize()
 
 	def writeHeader(self, f):
 		for i in range(16):
@@ -212,6 +234,13 @@ class FrameDescription:
 
 	def getSize(self):
 		return 20
+
+	def write(self, f):
+		f.write(b'FDSC')
+		f.write(uintBytes(self.getSize()))
+		f.write(self.compressionType)
+		f.write(uintBytes(self.height))
+		f.write(uintBytes(self.width))
 
 class AudioDescription:
 	def commonInit(self):
@@ -276,6 +305,22 @@ class AudioDescription:
 
 	def getSize(self):
 		return 20
+
+	def write(self, f):
+		f.write(b'ADSC')
+		f.write(uintBytes(self.getSize()))
+
+		audioData = self.channels
+		if self.bits == 16:
+			audioData |= 0x2
+		if self.compression == "n^2 compression":
+			audioData |= (0x1 << 2)
+
+		audioData |= self.signed << 31
+
+		f.write(uintBytes(audioData))
+		f.write(uintBytes(self.sclk))
+		f.write(uintBytes(self.driftRate))
 
 class Film(SampleContainer):
 	def __init__(self, frameDesc, audioDesc, chunkTable, sampleTable=None):
@@ -350,8 +395,8 @@ class Film(SampleContainer):
 		f.write(uintBytes(0)) # Version
 		f.write(uintBytes(0)) # Reserved
 
-		frameDesc.write(f)
-		audioDesc.write(f)
+		self.frameDesc.write(f)
+		self.audioDesc.write(f)
 
 		if self.sampleTable != None:
 			self.sampleTable.write(f)
@@ -373,6 +418,8 @@ class Film(SampleContainer):
 
 		cRec = self.chunkTable.chunkRecords[index]
 		cOffset = self.getDataOffset() + cRec.start
+
+		f.seek(cOffset, 0) # Seek cOffset bytes from SEEK_SET
 
 		return Chunk(f, cOffset, cRec.syncPattern)
 
@@ -399,7 +446,7 @@ class SampleIterator:
 			if self.currentChunk == None:
 				raise StopIteration
 
-			# Return Sample at sampleIndex
+			# Return Sample at currentSampleIndex
 			s = self.currentChunk.getSample(self.f, self.currentSampleIndex, self.readSampleData)
 
 			# Find next sample
@@ -490,7 +537,7 @@ class VidState:
 	def printCurrentIndices(self):
 		print("  Chunk: " + str(self.sampleIterator.getPreviousChunkIndex()))
 		print("  Sample: " + str(self.sampleIterator.getPreviousSampleIndex()))
-		
+
 
 	def checkSample(self, sampleRec):
 		nextSampleType = self.getNextSampleType()
@@ -500,19 +547,24 @@ class VidState:
 				print("Audio sample not found at expected time!")
 				self.printCurrentIndices()
 				print("  Vid time: " + str(self.vidTime) + " aNextTime: " + str(self.aNextTime))
-				sys.exit(1)
+				return False
 
 		else:
 			if sampleRec.type != 'Video':
 				print("Audio sample found before expected time!")
 				self.printCurrentIndices()
 				print("  Calculated time units remaining: " + str(self.aNextTime - float32(self.vidTime)))
-				sys.exit(1)
+				return False
+
+		return True
 
 	def checkFilm(self):
 		for s in self.sampleIterator:
-			self.checkSample(s.record)
+			if not self.checkSample(s.record):
+				return False
 			self.processSample(s.record)
+
+		return True
 
 with open("ct-1.crg", "rb") as cpkIn:
 	film = Film(cpkIn)
@@ -558,3 +610,16 @@ with open("ct-1.crg", "rb") as cpkIn:
 
 		vs = VidState(film, cpkIn)
 		vs.checkFilm()
+
+	with open("ct-1.fixed.crg", "wb") as cpkOut:
+		print("Writing new film header")
+
+		film.writeHeader(cpkOut)
+
+		for cIdx in range(len(film.chunkTable.chunkRecords)):
+			chunk = film.getChunk(cpkIn, cIdx)
+			chunk.writeHeader(cpkOut)
+			for sIdx in range(len(chunk.sampleTable.sampleRecords)):
+				print("Copying chunk " + str(cIdx) + " sample " + str(sIdx))
+				sample = chunk.getSample(cpkIn, sIdx, True)
+				cpkOut.write(sample.data)
