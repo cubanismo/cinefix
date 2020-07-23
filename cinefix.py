@@ -11,33 +11,30 @@ def uintBytes(i):
 	return i.to_bytes(4, byteorder='big', signed=False)
 
 class SampleRec:
-	def commonInit(self):
+	def calcValues(self):
 		if self.time == 0x7FFFFFFF:
 			self.type = 'Audio'
 		else:
 			self.type = 'Video'
-		
-	def __init__(self, start, size, time, duration):
-		self.start = start
-		self.size = size
-		self.time = time
-		self.duration = duration
-		self.commonInit()
 
-	def __init__(self, f):
+	def __init__(self, start=None, size=None, time=None, duration=None, f=None):
+		if f != None:
+			self.read(f)
+		else:
+			self.start = start
+			self.size = size
+			self.time = time
+			self.duration = duration
+			self.calcValues()
+
+	def read(self, f):
 		self.start = getInt(f)
 		self.size = getInt(f)
 		time = getInt(f)
 		self.time = time & 0x7FFFFFFF
 		self.shadowSyncSample = time >> 31
 		self.duration = getInt(f)
-		self.commonInit()
-
-	def isAudio(self):
-		if self.time == 0x7FFFFFFF:
-			return True
-		else:
-			return False
+		self.calcValues()
 
 	def write(self, f):
 		f.write(uintBytes(self.start))
@@ -45,16 +42,25 @@ class SampleRec:
 		f.write(uintBytes(self.time | self.shadowSyncSample << 31))
 		f.write(uintBytes(self.duration))
 
-class SampleTable:
-	def commonInit(self):
-		self.timeUnit = 1.0 / float(self.timescale)
-		
-	def __init__(self, timescale, sampleRecords):
-		self.timescale = timescale
-		self.sampleRecords = sampleRecords
-		self.commonInit()
+	def isAudio(self):
+		if self.type == 'Audio':
+			return True
+		else:
+			return False
 
-	def __init__(self, f):
+class SampleTable:
+	def calcValues(self):
+		self.timeUnit = 1.0 / float(self.timescale)
+
+	def __init__(self, timescale=None, sampleRecords=None, f=None):
+		if f != None:
+			self.read(f)
+		else:
+			self.timescale = timescale
+			self.sampleRecords = sampleRecords
+			self.calcValues()
+
+	def read(self, f):
 		hdr = f.read(4)
 
 		if b'STAB' != hdr:
@@ -65,8 +71,6 @@ class SampleTable:
 
 		self.timescale = getInt(f)
 
-		self.commonInit()
-
 		count = getInt(f)
 
 		self.sampleRecords = []
@@ -75,8 +79,10 @@ class SampleTable:
 			print("WARNING: Invalid sample header size detected!")
 	
 		for sNum in range(count):
-			sRec = SampleRec(f)
+			sRec = SampleRec(f=f)
 			self.sampleRecords.append(sRec)
+
+		self.calcValues()
 
 	def getSize(self):
 		return 16 + len(self.sampleRecords) * 16
@@ -95,13 +101,16 @@ class Sample:
 		self.data = data
 
 class ChunkRec:
-	def __init__(self, start, size, time, syncPattern):
-		self.start = start
-		self.size = size
-		self.time = time
-		self.syncPattern = syncPattern
+	def __init__(self, start=None, size=None, time=None, syncPattern=None, f=None):
+		if f != None:
+			self.read(f)
+		else:
+			self.start = start
+			self.size = size
+			self.time = time
+			self.syncPattern = syncPattern
 
-	def __init__(self, f):
+	def read(self, f):
 		self.start = getInt(f)
 		self.size = getInt(f)
 		self.time = getInt(f)
@@ -114,13 +123,16 @@ class ChunkRec:
 		f.write(uintBytes(self.syncPattern))
 
 class ChunkTable:
-	def __init__(self, timescale, chunkRecords):
-		self.timescale = timescale
-		self.chunkRecords = chunkRecords
-		for cRec in chunkRecords:
-			cRec.parent = self
+	def __init__(self, timescale=None, chunkRecords=None, f=None):
+		if f != None:
+			self.read(f)
+		else:
+			self.timescale = timescale
+			self.chunkRecords = chunkRecords
+			for cRec in chunkRecords:
+				cRec.parent = self
 
-	def __init__(self, f):
+	def read(self, f):
 		# XXX temp
 		hdr = f.read(4)
 
@@ -141,7 +153,7 @@ class ChunkTable:
 		self.chunkRecords = []
 
 		for cNum in range(count):
-			cRec = ChunkRec(f)
+			cRec = ChunkRec(f=f)
 			self.chunkRecords.append(cRec)
 
 	def getSize(self):
@@ -159,9 +171,12 @@ class ChunkTable:
 class SampleContainer:
 	def __init__(self, sampleTable=None, f=None):
 		if f != None:
-			self.sampleTable = SampleTable(f)
+			self.sampleTable = SampleTable(f=f)
 		else:
 			self.sampleTable = sampleTable
+
+	def read(self, f):
+		self.sampleTable = SampleTable(f=f)
 
 	def getSample(self, f, index, readData=False):
 		if index >= len(self.sampleTable.sampleRecords):
@@ -178,27 +193,32 @@ class SampleContainer:
 		return Sample(sRec, data)
 
 class Chunk(SampleContainer):
-	def commonInit(self, fileOffset, syncPattern):
+	def __init__(self, fileOffset, syncPattern, sampleTable=None, f=None):
 		self.fileOffset = fileOffset
 		self.syncPattern = syncPattern
 
-	def __init__(self, fileOffset, syncPattern, sampleTable):
-		SampleContainer.__init__(self, sampleTable=sampleTable)
-		self.commonInit(fileOffset, syncPattern)
+		if f != None:
+			self._readHeader(f)
+			SampleContainer.__init__(self, f=f)
+			self._skipSamples(f)
+		else:
+			SampleContainer.__init__(self, sampleTable=sampleTable)
 
-	def __init__(self, f, fileOffset, syncPattern):
+	def _readHeader(self, f):
 		for i in range(16):
 			syncData = getInt(f)
-			if syncData != syncPattern:
+			if syncData != self.syncPattern:
 				print("WARNING: Invalid sync data in chunk!")
-
-		SampleContainer.__init__(self, f=f)
-
-		self.commonInit(fileOffset, syncPattern)
-
+		
+	def _skipSamples(self, f):
 		# Skip past the sample data.
 		# Seek to offset of end of last sample from current position
 		f.seek(self.sampleTable.sampleRecords[-1].start + self.sampleTable.sampleRecords[-1].size, 1)
+
+	def read(self, f):
+		self._readHeader(f)
+		SampleContainer.read(self, f=f)
+		self._skipSamples(f)
 
 	def getDataOffset(self):
 		return self.fileOffset + 64 + self.sampleTable.getSize()
@@ -210,12 +230,15 @@ class Chunk(SampleContainer):
 		self.sampleTable.write(f)
 
 class FrameDescription:
-	def __init__(self, compressionType, width, height):
-		self.compressionType = compressionType
-		self.width = width
-		self.height = height
+	def __init__(self, compressionType=None, width=None, height=None, f=None):
+		if f != None:
+			self.read(f)
+		else:
+			self.compressionType = compressionType
+			self.width = width
+			self.height = height
 
-	def __init__(self, f):
+	def read(self, f):
 		hdr = f.read(4)
 
 		if b'FDSC' != hdr:
@@ -243,7 +266,7 @@ class FrameDescription:
 		f.write(uintBytes(self.width))
 
 class AudioDescription:
-	def commonInit(self):
+	def calcValues(self):
 		# This is the NTSC video clock, in Hz.  The PAL one is 26593900.
 		# Which is correct when value is baked into a region-agnostic file???
 		jagVidClock = 26590906
@@ -253,18 +276,21 @@ class AudioDescription:
 
 		# sampleRate = jagSampleRate + (jagSampleRate / (2^32 / driftRate))
 		self.sampleRate = float(jagSampleRate + Fraction(jagSampleRate, Fraction(0xFFFFFFFF, self.driftRate)))
-		
-	def __init__(self, channels=1, bits=8, compression="uncompressed", signed=0, sclk=0x18, driftRate=0x481db08):
-		self.channels = channels
-		self.bits = bits
-		self.compression = compression
-		self.signed = signed
-		self.sclk = sclk
-		self.driftRate = driftRate
 
-		self.commonInit()
+	def __init__(self, channels=1, bits=8, compression="uncompressed", signed=0, sclk=0x18, driftRate=0x481db08, f=None):
+		if f != None:
+			self.read(f)
+		else:
+			self.channels = channels
+			self.bits = bits
+			self.compression = compression
+			self.signed = signed
+			self.sclk = sclk
+			self.driftRate = driftRate
 
-	def __init__(self, f):	
+		self.calcValues()
+
+	def read(self, f):	
 		hdr = f.read(4)
 
 		if b'ADSC' != hdr:
@@ -301,7 +327,7 @@ class AudioDescription:
 
 		self.driftRate = getInt(f)
 
-		self.commonInit()
+		self.calcValues()
 
 	def getSize(self):
 		return 20
@@ -323,13 +349,25 @@ class AudioDescription:
 		f.write(uintBytes(self.driftRate))
 
 class Film(SampleContainer):
-	def __init__(self, frameDesc, audioDesc, chunkTable, sampleTable=None):
-		self.frameDesc = frameDesc
-		self.audioDesc = audioDesc
-		self.chunkTable = chunkTable
-		SampleContainer.__init__(self, sampleTable=sampleTable)
+	def __init__(self, frameDesc=None, audioDesc=None, chunkTable=None, sampleTable=None, f=None):
+		if f != None:
+			self._readHeader(f)
+			if self.type == 'Smooth':
+				SampleContainer.__init__(self, f=f)
+				self.chunkTable = None
+			elif self.type == 'Chunky':
+				SampleContainer.__init__(self, sampleTable=None)
+				self.chunkTable = ChunkTable(f=f)
+			else:
+				print("Neither Sample nor Chunk table found")
+				sys.exit(1)
+		else:
+			self.frameDesc = frameDesc
+			self.audioDesc = audioDesc
+			self.chunkTable = chunkTable
+			SampleContainer.__init__(self, sampleTable=sampleTable)
 
-	def __init__(self, f):
+	def _readHeader(self, f):
 		# Read Frame/Film header atom
 		hdr = f.read(4)
 
@@ -341,14 +379,14 @@ class Film(SampleContainer):
 		# Skip over version and reserved fields
 		f.seek(8, 1) # 8 bytes from SEEK_CUR
 
-		self.frameDesc = FrameDescription(f)
+		self.frameDesc = FrameDescription(f=f)
 
 		# Peak ahead to see if there is an Audio Description Atom?
 		hdr = f.read(4)
 		f.seek(-4, 1) # Seek back 4 bytes from SEEK_CUR
 
 		if b'ADSC' == hdr:
-			self.audioDesc = AudioDescription(f)
+			self.audioDesc = AudioDescription(f=f)
 		else:
 			self.audioDesc = AudioDescription()
 
@@ -359,13 +397,21 @@ class Film(SampleContainer):
 		f.seek(-4, 1) # Seek back 4 bytes from SEEK_CUR
 
 		if b'STAB' == hdr:
-			# Smooth film
-			SampleContainer.__init__(self, f=f)
-			self.chunkTable = None
+			self.type = 'Smooth'
 		elif b'CTAB' == hdr:
-			# Chunky film
-			SampleContainer.__init__(self)
-			self.chunkTable = ChunkTable(f)
+			self.type = 'Chunky'
+		else:
+			self.type = None
+
+	def read(self, f):
+		self._readHeader(f)
+
+		if self.type == 'Smooth':
+			SampleContainer.read(self, f=f)
+			chunkTable = None
+		elif self.type == 'Chunky':
+			SampleContainer.sampleTable = None
+			chunkTable = ChunkTable(f=f)
 		else:
 			print("Neither Sample nor Chunk table found")
 			sys.exit(1)
@@ -421,7 +467,7 @@ class Film(SampleContainer):
 
 		f.seek(cOffset, 0) # Seek cOffset bytes from SEEK_SET
 
-		return Chunk(f, cOffset, cRec.syncPattern)
+		return Chunk(cOffset, cRec.syncPattern, f=f)
 
 class SampleIterator:
 	def __init__(self, film, f, readSampleData=False):
@@ -567,7 +613,7 @@ class VidState:
 		return True
 
 with open("ct-1.crg", "rb") as cpkIn:
-	film = Film(cpkIn)
+	film = Film(f=cpkIn)
 
 	cType = film.frameDesc.compressionType
 
