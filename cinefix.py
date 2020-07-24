@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
 import sys
+from argparse import ArgumentParser
 from fractions import Fraction
 from numpy import float32
+
+VERSION_STRING="0.01"
 
 def getInt(f):
 	return int.from_bytes(f.read(4), byteorder='big')
@@ -753,7 +756,33 @@ class VidState:
 			for s in newSamples:
 				f.write(s.data)
 
-with open("ct-1.crg", "rb") as cpkIn:
+parser = ArgumentParser(description="Jaguar Cinepak Audio Fixer v" +
+			VERSION_STRING)
+parser.add_argument('-o', '--fixed-file', type=str, required=True,
+		    help='Name of file to store the output in')
+parser.add_argument('-a', '--fixed-aiff-file', type=str,
+		    help='Name of file to store the fixed cinepak data in with an AIFF wrapper.  If not specified, no AIFF file is generated')
+parser.add_argument('-t', '--fixed-track-file', type=str,
+		    help='Name of a track file to store the fixed cinepak data in with an AIFF and track wrapper in.  If not specified, no track file is generated.')
+parser.add_argument('-n', '--track-number', type=int,
+		    help='Track number to embed in the generated track file')
+parser.add_argument('-z', '--leading-zero-word', action='store_true',
+		    help='Write a dummy ZERO word at the start of the track file')
+parser.add_argument('input_file', metavar='INPUT_FILE',
+		    help='Chunk cinepak file')
+
+args = parser.parse_args()
+
+if args.fixed_track_file != None:
+	if args.fixed_aiff_file == None:
+		print("ERROR: An AIFF file is required to generate a track file")
+		sys.exit(1)
+
+	if args.track_number == None:
+		print("ERROR: Track number must be specified when writing a track file")
+		sys.exit(1)
+
+with open(args.input_file, "rb") as cpkIn:
 	film = Film(f=cpkIn)
 
 	cType = film.frameDesc.compressionType
@@ -798,7 +827,7 @@ with open("ct-1.crg", "rb") as cpkIn:
 		vs = VidState(film, cpkIn)
 		vs.checkFilm()
 
-	with open("ct-1f.crg", "wb") as cpkOut:
+	with open(args.fixed_file, "wb") as cpkOut:
 		print("Writing new film header")
 
 		# First create a new sample or chunk table
@@ -815,10 +844,13 @@ with open("ct-1.crg", "rb") as cpkIn:
 
 		vs.writeFixedData(fixedFilm, cpkOut)
 
+if args.fixed_aiff_file == None:
+	sys.exit(0)
+
 # Wrap the fixed file in a dummy AIFF header and (obsolete) sync marker padding
 # Details on the AIFF file format are available here:
 #   http://www-mmsp.ece.mcgill.ca/Documents/AudioFormats/AIFF/Docs/AIFF-1.3.pdf
-with open("ct-1f.crg", "rb") as cpkIn, open("ct-1f.aif", "wb") as aifOut:
+with open(args.fixed_file, "rb") as cpkIn, open(args.fixed_aiff_file, "wb") as aifOut:
 	cpkIn.seek(0, 2) # Seek to 0 bytes from SEEK_END
 	cpkSize = cpkIn.tell()
 	cpkIn.seek(0, 0) # Seek to 0 bytes from SEEK_SET
@@ -957,8 +989,11 @@ with open("ct-1f.crg", "rb") as cpkIn, open("ct-1f.aif", "wb") as aifOut:
 	for i in range(trailerSize & 0x3):
 		aifOut.write(b'B')
 
+if args.fixed_track_file == None:
+	sys.exit(0)
+
 # Wrap the AIFF-wrapped file with Jaguar CD track header/trailer
-with open("ct-1f.aif", "rb") as aifIn, open("ct-1f.t01", "wb") as trkOut:
+with open(args.fixed_aiff_file, "rb") as aifIn, open(args.fixed_track_file, "wb") as trkOut:
 	# From the Jaguar CD-ROM documentation, section 6.1:
 	#
 	# Jaguar CD header format:
@@ -987,11 +1022,8 @@ with open("ct-1f.aif", "rb") as aifIn, open("ct-1f.t01", "wb") as trkOut:
 	aifSize = aifIn.tell()
 	aifIn.seek(0, 0) # Seek to 0 bytes from SEEK_SET
 
-	# XXX Hard coded to second track here, and in filename above
-	trackNumber = 1
-
-	# Write dummy zero word? XXX Hard-coded to 'yes'
-	writeDummyZero = True
+	# Write dummy zero word?
+	writeDummyZero = args.leading_zero_word
 
 	if writeDummyZero:
 		trkOut.write(uint16Bytes(0x0000))
@@ -1000,9 +1032,9 @@ with open("ct-1f.aif", "rb") as aifIn, open("ct-1f.t01", "wb") as trkOut:
 	for i in range(16):
 		trkOut.write(b'ATRI')
 	trkOut.write(b'ATARI APPROVED DATA HEADER ATRI')
-	trkOut.write(uint8Bytes(0x20 + trackNumber))
+	trkOut.write(uint8Bytes(0x20 + args.track_number))
 
-	marker = 'TR{:02X}'.format(trackNumber).encode(encoding='ascii')
+	marker = 'TR{:02X}'.format(args.track_number).encode(encoding='ascii')
 
 	for i in range(16):
 		trkOut.write(marker)
@@ -1022,6 +1054,6 @@ with open("ct-1f.aif", "rb") as aifIn, open("ct-1f.t01", "wb") as trkOut:
 
 	# Write the Atari track trailer
 	trkOut.write(b'ATARI APPROVED DATA TAILER ATRI')
-	trkOut.write(uint8Bytes(0x20 + trackNumber))
+	trkOut.write(uint8Bytes(0x20 + args.track_number))
 	for i in range(16):
 		trkOut.write(b'ATRI')
