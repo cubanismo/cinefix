@@ -13,6 +13,9 @@ def uintBytes(i):
 def uint16Bytes(i):
 	return i.to_bytes(2, byteorder='big', signed=False)
 
+def uint8Bytes(i):
+	return i.to_bytes(1, byteorder='big', signed=False)
+
 class SampleRec:
 	def calcValues(self):
 		if self.time == 0x7FFFFFFF:
@@ -385,9 +388,8 @@ class Film(SampleContainer):
 
 		self.frameDesc = FrameDescription(f=f)
 
-		# Peak ahead to see if there is an Audio Description Atom?
-		hdr = f.read(4)
-		f.seek(-4, 1) # Seek back 4 bytes from SEEK_CUR
+		# Peek ahead to see if there is an Audio Description Atom?
+		hdr = f.peek(4)[:4]
 
 		if b'ADSC' == hdr:
 			self.audioDesc = AudioDescription(f=f)
@@ -396,9 +398,8 @@ class Film(SampleContainer):
 
 		self.chunks = []
 
-		# Peak ahead to see if this is a chunky or smooth film
-		hdr = f.read(4)
-		f.seek(-4, 1) # Seek back 4 bytes from SEEK_CUR
+		# Peek ahead to see if this is a chunky or smooth film
+		hdr = f.peek(4)[:4]
 
 		if b'STAB' == hdr:
 			self.type = 'Smooth'
@@ -822,17 +823,41 @@ with open("ct-1f.crg", "rb") as cpkIn, open("ct-1f.aif", "wb") as aifOut:
 	cpkSize = cpkIn.tell()
 	cpkIn.seek(0, 0) # Seek to 0 bytes from SEEK_SET
 
-	# 24 x 2352 (CD block size) blocks of 'A'.  Note JagCinePak uses 0xdc82
-	# instead, and the Jaguar Cinepak documentation suggests 0xdc7e is used,
-	# but 0xdc80 matches the cpkdemo player.inc values the Jaguar Cinepak
-	# documentation refers to, and makes a lot more sense
-	leaderSize = 0xdc80 # 24 x 2352 byte blocks of 'A'
+	# (24 x 2352) - 2 (2352 == CD block size) blocks of 'A'.  Note
+	# JagCinePak uses 0xdc82 instead.  The Jaguar Cinepak documentation
+	# suggests 0xdc7e is used, as is done here.  The cpkdemo's player.inc
+	# uses 0xdc80, which is an even mulitple of CDDA blocks.
+	#
+	# In practice, since the player looks for the sync pattern that follows
+	# this padding using a large search window, the exact size used here
+	# does not matter.  What does matter is that the sync pattern ends up
+	# long-word aligned.  24 x 2352 is long-word aligned, but the player is
+	# not accounting for the size of the AIFF header (The original reason
+	# for including an AIFF header was that the CD mastering software
+	# expected it and would strip it out before burning.  However, Atari
+	# then stopped trying to support such software it seems, and added the
+	# separate track header/trailer data structures, but apparently
+	# neglected to stop wrapping their cinepak files in AIFF headers before
+	# wrapping them in track headers/trailers, so the AIFF header ends up on
+	# the disk just wasting space, and the player is still written as if it
+	# expects the AIFF header to have been stripped).  Since the AIFF header
+	# is not a long-word aligned size (0x36), using the correct long-word
+	# aligned padding size here will throw off the sync marker alignment and
+	# the player won't find it.  To compensate, the padding size must be
+	# rounded up or down 2 bytes.  JagCinePak rounded up, perhaps matching
+	# the original Atari tool's implementation (I don't have access to that
+	# tool, just speculating).  I'm rounding down to match the
+	# documentation.
+	leaderSize = 0xdc7e
 
 	# 64 bytes of '1'.  Note JagCinePak doesn't include this in its AIFF
-	# size fields
-	syncDataSize = 0x40 # 64 bytes of '1'
+	# size fields.
+	#
+	# As noted above, it is CRITICAL that this data be long-word aligned in
+	# the final track on disk, or the player will fail to locate the movie.
+	syncDataSize = 0x40
 
-	# 22146 bytes (Unknown reason for this size) of 'B' This is not
+	# 22146 bytes (Unknown reason for this size) of 'B'. This is not
 	# documented anywhere I can find, and I see no reason for it, but
 	# including it to match JagCinePak.
 	trailerSize = 0x5682
@@ -913,6 +938,8 @@ with open("ct-1f.crg", "rb") as cpkIn, open("ct-1f.aif", "wb") as aifOut:
 	# Write the "sound" data:
 	for i in range(leaderSize >> 2):
 		aifOut.write(b'AAAA')
+	for i in range(leaderSize & 0x3):
+		aifOut.write(b'A')
 
 	for i in range(syncDataSize >> 2):
 		aifOut.write(b'1111')
@@ -925,5 +952,76 @@ with open("ct-1f.crg", "rb") as cpkIn, open("ct-1f.aif", "wb") as aifOut:
 		else:
 			break
 
-	for i in range(trailerSize >> 1):
-		aifOut.write(b'BB')
+	for i in range(trailerSize >> 2):
+		aifOut.write(b'BBBB')
+	for i in range(trailerSize & 0x3):
+		aifOut.write(b'B')
+
+# Wrap the AIFF-wrapped file with Jaguar CD track header/trailer
+with open("ct-1f.aif", "rb") as aifIn, open("ct-1f.t01", "wb") as trkOut:
+	# From the Jaguar CD-ROM documentation, section 6.1:
+	#
+	# Jaguar CD header format:
+	#   Optional dummy zero word (0x0000) to force alignment
+	#   16 long-words of 'ATRI'
+	#   'ATARI APPROVED DATA HEADER ATRI'
+	#   0x20 + <track number>
+	#
+	# Jaguar CD trailer format:
+	#   'ATARI APPROVED DATA TAILER ATRI'
+	#   0x20 + <track number>
+	#   16 long-words of 'ATRI'
+	#
+	# <track number> is zero-based.
+	#
+	# The beginning and end of these markers must be long-word aligned.
+	# The optional leading zero-word is intended to ensure that alignment
+	# on mastering/burning software that inserts a dummy zero word of its
+	# own (2 + 2 = 4, long word aligned).
+	#
+	# From inspection of track files generated by both Atari's maketrk and
+	# JagCinePak, a 'partition marker', defaulting to TR<track number>, is
+	# added just after the header as well.
+
+	aifIn.seek(0, 2) # Seek to 0 bytes from SEEK_END
+	aifSize = aifIn.tell()
+	aifIn.seek(0, 0) # Seek to 0 bytes from SEEK_SET
+
+	# XXX Hard coded to second track here, and in filename above
+	trackNumber = 1
+
+	# Write dummy zero word? XXX Hard-coded to 'yes'
+	writeDummyZero = True
+
+	if writeDummyZero:
+		trkOut.write(uint16Bytes(0x0000))
+
+	# Write the Atari track header
+	for i in range(16):
+		trkOut.write(b'ATRI')
+	trkOut.write(b'ATARI APPROVED DATA HEADER ATRI')
+	trkOut.write(uint8Bytes(0x20 + trackNumber))
+
+	marker = 'TR{:02X}'.format(trackNumber).encode(encoding='ascii')
+
+	for i in range(16):
+		trkOut.write(marker)
+
+	while True:
+		buf = aifIn.read(0x1000)
+
+		if buf:
+			trkOut.write(buf)
+		else:
+			break
+
+	# zero-pad the track data up to a long-word boundary.
+	zeroPaddingSize = (4 - (aifSize & 0x3)) % 4
+	for i in range(zeroPaddingSize):
+		trkOut.write(uint8Bytes(0x00))
+
+	# Write the Atari track trailer
+	trkOut.write(b'ATARI APPROVED DATA TAILER ATRI')
+	trkOut.write(uint8Bytes(0x20 + trackNumber))
+	for i in range(16):
+		trkOut.write(b'ATRI')
