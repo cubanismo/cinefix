@@ -10,6 +10,9 @@ def getInt(f):
 def uintBytes(i):
 	return i.to_bytes(4, byteorder='big', signed=False)
 
+def uint16Bytes(i):
+	return i.to_bytes(2, byteorder='big', signed=False)
+
 class SampleRec:
 	def calcValues(self):
 		if self.time == 0x7FFFFFFF:
@@ -810,3 +813,117 @@ with open("ct-1.crg", "rb") as cpkIn:
 		fixedFilm.writeHeader(cpkOut)
 
 		vs.writeFixedData(fixedFilm, cpkOut)
+
+# Wrap the fixed file in a dummy AIFF header and (obsolete) sync marker padding
+# Details on the AIFF file format are available here:
+#   http://www-mmsp.ece.mcgill.ca/Documents/AudioFormats/AIFF/Docs/AIFF-1.3.pdf
+with open("ct-1f.crg", "rb") as cpkIn, open("ct-1f.aif", "wb") as aifOut:
+	cpkIn.seek(0, 2) # Seek to 0 bytes from SEEK_END
+	cpkSize = cpkIn.tell()
+	cpkIn.seek(0, 0) # Seek to 0 bytes from SEEK_SET
+
+	# 24 x 2352 (CD block size) blocks of 'A'.  Note JagCinePak uses 0xdc82
+	# instead, and the Jaguar Cinepak documentation suggests 0xdc7e is used,
+	# but 0xdc80 matches the cpkdemo player.inc values the Jaguar Cinepak
+	# documentation refers to, and makes a lot more sense
+	leaderSize = 0xdc80 # 24 x 2352 byte blocks of 'A'
+
+	# 64 bytes of '1'.  Note JagCinePak doesn't include this in its AIFF
+	# size fields
+	syncDataSize = 0x40 # 64 bytes of '1'
+
+	# 22146 bytes (Unknown reason for this size) of 'B' This is not
+	# documented anywhere I can find, and I see no reason for it, but
+	# including it to match JagCinePak.
+	trailerSize = 0x5682
+
+	# AIFF Common chunk size:
+	commonSize = 0x12
+
+	# AIFF Sound metadata size:
+	soundMetaSize = 0x8
+
+	# soundData field size
+	soundDataSize = cpkSize + leaderSize + syncDataSize + trailerSize
+
+	# chunk size of sound block
+	soundSize = soundDataSize + soundMetaSize
+
+	# formType + common chunk header + sound chunk header + data
+	formSize = 0x4 + 0x8 + 0x8 + commonSize + soundSize
+
+	# Write the FORM chunk header
+	aifOut.write(b'FORM')
+	aifOut.write(uintBytes(formSize))
+	aifOut.write(b'AIFF')
+
+	# Write the common chunk
+	#
+	# The actual values here don't really matter, but are chosen to look
+	# like a valid audio file the same size as the film with its padding.
+	# JagCinePak tries to use this scheme I think:
+	#   channels = 2 (Stereo)
+	#   numSampleFrames = <size of "sound" data, film + padding
+	#   sampleSize = 16 bits
+	#   sampleRate = 44100Hz in Apple's 80-bit floating point format
+	# However, this results in non-sensical data.  sampleSize, rounded up to
+	# the nearest byte, times channels should equal numSampleFrames.  Hence,
+	# to keep things simple but sensible, I've used channels = 1 and
+	# sampleSize = 8 instead.  This won't trick any CD burning software into
+	# thinking the data is CD-compatible, but other AIFF parsers might
+	# handle it better.
+	#
+	# See this document for more info on Apple's weird "extended" floating
+	# point format:
+	#
+	#   https://vintageapple.org/inside_o/pdf/Apple_Numerics_Manual_Second_Edition_1988.pdf
+	#
+	# But note it is the same as x87 80-bit floating point, and
+	# documentation for that is more readily available.
+	aifOut.write(b'COMM')
+	aifOut.write(uintBytes(commonSize))
+	# Channels
+	aifOut.write(uint16Bytes(2))
+	# Sample Frames
+	aifOut.write(uintBytes(soundDataSize))
+	# Sample size
+	aifOut.write(uint16Bytes(8))
+	# Sample rate:
+	#  sign=0 (positive)
+	#  exponent=15 (0x400e - 0x3fff)
+	#  i=1 (normalized)
+	#  fraction=0x2c44000000000000
+	#  Packed we get 0x400eac44000000000000, broken into 5 words
+	aifOut.write(uint16Bytes(0x400e))
+	aifOut.write(uint16Bytes(0xac44))
+	aifOut.write(uint16Bytes(0x0000))
+	aifOut.write(uint16Bytes(0x0000))
+	aifOut.write(uint16Bytes(0x0000))
+
+	# Write the sound chunk
+	aifOut.write(b'SSND')
+	aifOut.write(uintBytes(soundSize))
+
+	# offset
+	aifOut.write(uintBytes(0))
+
+	# blockSize
+	aifOut.write(uintBytes(0))
+
+	# Write the "sound" data:
+	for i in range(leaderSize >> 2):
+		aifOut.write(b'AAAA')
+
+	for i in range(syncDataSize >> 2):
+		aifOut.write(b'1111')
+
+	while True:
+		buf = cpkIn.read(0x1000)
+
+		if buf:
+			aifOut.write(buf)
+		else:
+			break
+
+	for i in range(trailerSize >> 1):
+		aifOut.write(b'BB')
