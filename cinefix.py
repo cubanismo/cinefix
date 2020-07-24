@@ -17,13 +17,14 @@ class SampleRec:
 		else:
 			self.type = 'Video'
 
-	def __init__(self, start=None, size=None, time=None, duration=None, f=None):
+	def __init__(self, start=None, size=None, time=None, shadowSyncSample=None, duration=None, f=None):
 		if f != None:
 			self.read(f)
 		else:
 			self.start = start
 			self.size = size
 			self.time = time
+			self.shadowSyncSample = shadowSyncSample
 			self.duration = duration
 			self.calcValues()
 
@@ -449,7 +450,7 @@ class Film(SampleContainer):
 		else:
 			self.chunkTable.write(f)
 
-	def getSample(self, f, index, readData):
+	def getSample(self, f, index, readData=False):
 		if self.sampleTable == None:
 			return None
 
@@ -468,6 +469,9 @@ class Film(SampleContainer):
 		f.seek(cOffset, 0) # Seek cOffset bytes from SEEK_SET
 
 		return Chunk(cOffset, cRec.syncPattern, f=f)
+
+	def isChunky(self):
+		return (self.type == 'Chunky')
 
 class SampleIterator:
 	def __init__(self, film, f, readSampleData=False):
@@ -548,27 +552,33 @@ class VideoSampleIterator(SampleIterator):
 		return s
 
 class VidState:
-	def __init__(self, film, f):
-		self.sampleRate = float32(film.audioDesc.sampleRate)
-		self.timescale = float32(film.getTimescale())
+	def reset(self):
 		self.vidTime = 0
 		self.aNextTime = float32(0)
 		self.firstAudioSample = True
-		self.sampleIterator = SampleIterator(film, f)
+
+	def __init__(self, film, f):
+		self.sampleRate = float32(film.audioDesc.sampleRate)
+		self.timescale = float32(film.getTimescale())
+		self.film = film
+		self.file = f
+		if self.film.isChunky():
+			# Handle one-chunk films :-(
+			self.chunkDuration = self.film.chunkTable.chunkRecords[1].time - self.film.chunkTable.chunkRecords[0].time
 
 	def setNextAudioSampleTime(self, curSample):
 		# XXX assumes 8-bit audio
 		sampleDuration = (float32(curSample.size) / self.sampleRate) * self.timescale
-		print("Audio sample duration: " + str(sampleDuration))
+		#print("Audio sample duration: " + str(sampleDuration))
 		if self.firstAudioSample:
 			self.aNextTime += float32(sampleDuration) / float32(2.0)
 			self.firstAudioSample = False
 		else:
 			self.aNextTime = float32(sampleDuration) + self.aNextTime
 
-		print("Next audio sample at: " + str(self.aNextTime) + " current vidTime: " + str(self.vidTime))
+		#print("Next audio sample at: " + str(self.aNextTime) + " current vidTime: " + str(self.vidTime))
 
-	def getNextSampleType(self):
+	def calcNextSampleType(self):
 		if self.aNextTime < float32(self.vidTime + 1):
 			return 'Audio'
 		else:
@@ -580,37 +590,164 @@ class VidState:
 		else:
 			self.vidTime += curSample.duration
 
-	def printCurrentIndices(self):
-		print("  Chunk: " + str(self.sampleIterator.getPreviousChunkIndex()))
-		print("  Sample: " + str(self.sampleIterator.getPreviousSampleIndex()))
+	def printCurrentIndices(self, sampleIterator):
+		print("  Chunk: " + str(sampleIterator.getPreviousChunkIndex()))
+		print("  Sample: " + str(sampleIterator.getPreviousSampleIndex()))
 
 
-	def checkSample(self, sampleRec):
-		nextSampleType = self.getNextSampleType()
+	def checkSample(self, sampleRec, sampleIterator):
+		nextSampleType = self.calcNextSampleType()
 
 		if nextSampleType == 'Audio':
 			if sampleRec.type != 'Audio':
 				print("Audio sample not found at expected time!")
-				self.printCurrentIndices()
+				self.printCurrentIndices(sampleIterator)
 				print("  Vid time: " + str(self.vidTime) + " aNextTime: " + str(self.aNextTime))
 				return False
 
 		else:
 			if sampleRec.type != 'Video':
 				print("Audio sample found before expected time!")
-				self.printCurrentIndices()
+				self.printCurrentIndices(sampleIterator)
 				print("  Calculated time units remaining: " + str(self.aNextTime - float32(self.vidTime)))
 				return False
 
 		return True
 
 	def checkFilm(self):
-		for s in self.sampleIterator:
-			if not self.checkSample(s.record):
+		self.reset()
+		sampleIterator = SampleIterator(self.film, self.file)
+		for s in sampleIterator:
+			if not self.checkSample(s.record, sampleIterator):
 				return False
 			self.processSample(s.record)
 
 		return True
+
+	def getFixedChunkTable(self):
+		self.reset()
+
+		asi = AudioSampleIterator(self.film, self.file).__iter__()
+		vsi = VideoSampleIterator(self.film, self.file).__iter__()
+
+		newChunks = []
+		# XXX Write a syncPatten "forever" iterator
+		# Init size to size of sync pattern + empty sample table
+		curRec = ChunkRec(start=0, size=64+16, time=0, syncPattern=0x20202020)
+		curChunkDuration = 0
+		done = False
+
+		while not done:
+			nextType = self.calcNextSampleType()
+
+			sample = None
+			if nextType == 'Audio':
+				try:
+					sample = next(asi)
+				except StopIteration:
+					# This is normal.  Audio is pre-buffered
+					# in the stream to ensure the audio
+					# buffer in the player doesn't empty, so
+					# we will always run out of audio
+					# samples near the end of the stream
+					# even when interleaving them correctly.
+					pass
+			if sample == None:
+				try:
+					sample = next(vsi)
+				except StopIteration:
+					# Due to the note above about audio
+					# samples being pre-buffered, it is safe
+					# to assume running out of video samples
+					# means we've reached the end of the
+					# stream.
+					done = True
+
+				if sample != None:
+					curChunkDuration += sample.record.duration
+				else:
+					# Assert done == True
+					pass
+
+			if sample != None:
+				# Add in the size of the sample
+				curRec.size += sample.record.size
+				# Add in the size of a sample record
+				curRec.size += 16
+			else:
+				# Assert done == True
+				pass
+
+			if curChunkDuration >= self.chunkDuration or done:
+				print("Adding fixed chunk rec #" + str(len(newChunks)) + " from " + str(curRec.time) + " to " + str(curRec.time + curChunkDuration) + " of size " + hex(curRec.size))
+				newChunks.append(curRec)
+				newStart = curRec.start + curRec.size
+				newTime = curRec.time + curChunkDuration
+				newPattern = curRec.syncPattern + 0x01010101
+				if newPattern >= 0x80808080:
+					newPattern = 0x20202020
+				# Initi size to size of sync pattern+empty sample table
+				curRec = ChunkRec(start=newStart, size=64+16, time=newTime, syncPattern=newPattern)
+				curChunkDuration = 0
+
+			if sample != None:
+				self.processSample(sample.record)
+			else:
+				# Assert done == True
+				pass
+
+		return ChunkTable(timescale=self.film.getTimescale(), chunkRecords=newChunks)
+
+	def writeFixedData(self, fixedFilm, f):
+		self.reset()
+
+		asi = AudioSampleIterator(self.film, self.file, readSampleData=True).__iter__()
+		vsi = VideoSampleIterator(self.film, self.file, readSampleData=True).__iter__()
+
+		for cRec in fixedFilm.chunkTable.chunkRecords:
+			newSamples = []
+			newSampleRecs = []
+			# Init size to size of sync pattern + empty sync table
+			chunkHdrSize = 64 + 16
+			chunkDataSize = 0
+
+			while chunkDataSize < cRec.size - chunkHdrSize:
+				nextType = self.calcNextSampleType()
+
+				sample = None
+				if nextType == 'Audio':
+					try:
+						sample = next(asi)
+					except StopIteration:
+						pass
+
+				if sample == None:
+					try:
+						sample = next(vsi)
+					except StopIteration:
+						print("Ran out of video samples while writing sample data")
+						sys.exit(1)
+
+				if sample.record.isAudio():
+					newTime = sample.record.time
+				else:
+					newTime = self.vidTime
+
+				newSampleRec = SampleRec(start=chunkDataSize, size=sample.record.size, time=newTime, shadowSyncSample=sample.record.shadowSyncSample, duration=sample.record.duration)
+				newSampleRecs.append(newSampleRec)
+				# Add in sample data size
+				chunkDataSize += newSampleRec.size
+				# Add in sample record size
+				chunkHdrSize += 16
+				newSamples.append(Sample(newSampleRec, sample.data))
+
+				self.processSample(sample.record)
+
+			newSampleTable = SampleTable(timescale=self.film.getTimescale(), sampleRecords=newSampleRecs)
+			chunk = Chunk(fileOffset=cRec.start, syncPattern=cRec.syncPattern, sampleTable=newSampleTable)
+			chunk.writeHeader(f)
+			for s in newSamples:
+				f.write(s.data)
 
 with open("ct-1.crg", "rb") as cpkIn:
 	film = Film(f=cpkIn)
@@ -657,15 +794,19 @@ with open("ct-1.crg", "rb") as cpkIn:
 		vs = VidState(film, cpkIn)
 		vs.checkFilm()
 
-	with open("ct-1.fixed.crg", "wb") as cpkOut:
+	with open("ct-1f.crg", "wb") as cpkOut:
 		print("Writing new film header")
 
-		film.writeHeader(cpkOut)
+		# First create a new sample or chunk table
+		vs = VidState(film, cpkIn)
+		if film.isChunky():
+			fixedSampleTable = None
+			fixedChunkTable = vs.getFixedChunkTable()
+		else:
+			fixedSampleTable = vs.getFixedSampleTable()
+			fixedChunkTable = None
 
-		for cIdx in range(len(film.chunkTable.chunkRecords)):
-			chunk = film.getChunk(cpkIn, cIdx)
-			chunk.writeHeader(cpkOut)
-			for sIdx in range(len(chunk.sampleTable.sampleRecords)):
-				print("Copying chunk " + str(cIdx) + " sample " + str(sIdx))
-				sample = chunk.getSample(cpkIn, sIdx, True)
-				cpkOut.write(sample.data)
+		fixedFilm = Film(frameDesc=film.frameDesc, audioDesc=film.audioDesc, chunkTable=fixedChunkTable, sampleTable=fixedSampleTable)
+		fixedFilm.writeHeader(cpkOut)
+
+		vs.writeFixedData(fixedFilm, cpkOut)
